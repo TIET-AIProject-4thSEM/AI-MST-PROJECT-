@@ -1,0 +1,17 @@
+{
+  "model_name": "Random Forest",
+  "features": [
+    "cpu_utilization_smooth",
+    "memory_usage_smooth",
+    "ambient_temp_smooth",
+    "hour",
+    "day_of_week",
+    "is_business",
+    "cpu_util_lag1",
+    "cpu_util_lag3",
+    "cpu_util_lag6"
+  ],
+  "test_r2": 0.9516,
+  "test_rmse": 3.2415,
+  "test_mae": 2.3676
+}
