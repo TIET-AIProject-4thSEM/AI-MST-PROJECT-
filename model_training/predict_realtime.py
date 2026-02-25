@@ -146,6 +146,7 @@ class ThermalDemo:
         else:
             print(f"{YELLOW}⚠  model_info.json missing — feature order inferred.{RESET}")
 
+<<<<<<< HEAD
     # ── Arduino auto-detection ────────────────────────────────────────────────
     def _init_arduino(self, preferred_port=None):
         """
@@ -219,14 +220,30 @@ class ThermalDemo:
 
                 if conn.in_waiting:
                     raw  = conn.readline().decode('utf-8', errors='ignore').strip()
+=======
+    # ── Arduino ───────────────────────────────────────────────────────────────
+    def _init_arduino(self, port):
+        if not SERIAL_AVAILABLE:
+            print("⚠  pyserial not installed — no hardware control.")
+            return
+        for p in [port, '/dev/ttyUSB0', '/dev/ttyUSB1',
+                  '/dev/ttyACM0', 'COM3', 'COM4', 'COM5']:
+            try:
+                self.arduino = serial.Serial(p, 9600, timeout=1)
+                time.sleep(2.5)
+                self.arduino.reset_input_buffer()
+                self.arduino.reset_output_buffer()
+                self.arduino.write(b'T\n')
+                time.sleep(0.85)
+                if self.arduino.in_waiting:
+                    raw  = self.arduino.readline().decode('utf-8', errors='ignore').strip()
+>>>>>>> parent of 00be971 (the results seem worse than previous predict realtime)
                     temp = float(raw)
                     if -55 <= temp <= 125:
-                        self.arduino    = conn
+                        print(f"{GREEN}✓ DS18B20 on {p}{RESET}  — {temp:.4f}°C")
                         self.arduino_ok = True
-                        print(f"  {GREEN}✓ DS18B20 found on {port}{RESET}")
-                        print(f"    Current ambient reading: {temp:.4f}°C")
-                        print(f"{'─'*60}\n")
                         return
+<<<<<<< HEAD
                     else:
                         print(f"  {YELLOW}✗ {port:<18}{RESET} — value out of DS18B20 range: {raw!r}")
                         conn.close()
@@ -251,6 +268,11 @@ class ThermalDemo:
         print("     Check the Arduino sketch responds to 'T\\n' at 9600 baud.")
         print(f"\n  Falling back to synthetic ambient (24°C ± 2°C sine wave).")
         print(f"{'─'*60}\n")
+=======
+            except Exception:
+                continue
+        print("⚠  Arduino not found — ambient simulated, fan commands logged only.")
+>>>>>>> parent of 00be971 (the results seem worse than previous predict realtime)
 
     # ── sensors ───────────────────────────────────────────────────────────────
     def _read_cpu_temp(self):
