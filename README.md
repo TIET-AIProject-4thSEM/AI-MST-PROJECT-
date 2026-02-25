@@ -1,2 +1,2 @@
-# AI-MST-PROJECT-
+# AI-MST-PROJECT
 mst project for AI 
