@@ -145,29 +145,123 @@ class ThermalDemo:
             print(f"{YELLOW}⚠  model_info.json missing — feature order inferred.{RESET}")
 
     # ── Arduino ───────────────────────────────────────────────────────────────
-    def _init_arduino(self, port):
+    def _init_arduino(self, preferred_port=None):
+        """
+        Auto-detect Arduino + DS18B20 on all available serial ports.
+
+        Port scan order:
+          1. preferred_port (from --port arg), if given
+          2. Ports reported by serial.tools.list_ports that look like Arduino
+             (USB serial devices, ACM devices, CH340/CP210x/FTDI chips)
+          3. Fixed fallback list covering common Fedora and Windows paths
+
+        Prints a clear status line for every port tried so the user always
+        knows what was found and why it was accepted or rejected.
+        """
         if not SERIAL_AVAILABLE:
-            print("⚠  pyserial not installed — no hardware control.")
+            print(f"{YELLOW}⚠  pyserial not installed.{RESET}")
+            print("    Install it:  pip install pyserial")
+            print("    Falling back to synthetic ambient temperature.\n")
             return
-        for p in [port, '/dev/ttyUSB0', '/dev/ttyUSB1',
-                  '/dev/ttyACM0', 'COM3', 'COM4', 'COM5']:
+
+        print(f"\n{BOLD}── Arduino auto-detection ──────────────────────────────────{RESET}")
+
+        # ── build candidate list ───────────────────────────────────────────────
+        candidates = []
+
+        if preferred_port:
+            candidates.append(preferred_port)
+            print(f"  Priority port from --port arg: {preferred_port}")
+
+        # use list_ports to find real USB serial devices plugged in right now
+        try:
+            detected = list(serial.tools.list_ports.comports())
+            usb_ports = []
+            for p in detected:
+                desc = (p.description or '').lower()
+                hwid = (p.hwid or '').lower()
+                # Arduino Uno/Nano use CH340, CP2102, FTDI, or show as ACM
+                is_arduino = any(kw in desc or kw in hwid for kw in
+                                 ('arduino', 'ch340', 'ch341', 'cp210',
+                                  'ftdi', 'usb serial', 'acm'))
+                if is_arduino or 'usb' in hwid:
+                    usb_ports.append(p.device)
+
+            if usb_ports:
+                print(f"  USB serial devices found: {usb_ports}")
+            else:
+                print(f"  No USB serial devices auto-detected — will try fallback list.")
+
+            # add detected ports that aren't already in the list
+            for p in usb_ports:
+                if p not in candidates:
+                    candidates.append(p)
+        except Exception as e:
+            print(f"  {YELLOW}list_ports scan failed ({e}) — using fallback list only.{RESET}")
+
+        # fixed fallback paths: Fedora/Linux first, then Windows
+        fallbacks = [
+            '/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2',
+            '/dev/ttyACM0', '/dev/ttyACM1',
+            'COM3', 'COM4', 'COM5', 'COM6', 'COM7',
+        ]
+        for p in fallbacks:
+            if p not in candidates:
+                candidates.append(p)
+
+        # ── try each port ──────────────────────────────────────────────────────
+        print(f"  Trying {len(candidates)} port(s)…\n")
+
+        for port in candidates:
             try:
-                self.arduino = serial.Serial(p, 9600, timeout=1)
-                time.sleep(2.5)
-                self.arduino.reset_input_buffer()
-                self.arduino.reset_output_buffer()
-                self.arduino.write(b'T\n')
-                time.sleep(0.85)
-                if self.arduino.in_waiting:
-                    raw  = self.arduino.readline().decode('utf-8', errors='ignore').strip()
+                conn = serial.Serial(port, 9600, timeout=1)
+                time.sleep(2.5)   # wait for Arduino bootloader to finish
+                conn.reset_input_buffer()
+                conn.reset_output_buffer()
+
+                # request a temperature reading from the DS18B20
+                conn.write(b'T\n')
+                time.sleep(0.9)   # DS18B20 needs ~750 ms for 12-bit conversion
+
+                if conn.in_waiting:
+                    raw  = conn.readline().decode('utf-8', errors='ignore').strip()
                     temp = float(raw)
                     if -55 <= temp <= 125:
-                        print(f"{GREEN}✓ DS18B20 on {p}{RESET}  — {temp:.4f}°C")
+                        self.arduino    = conn
                         self.arduino_ok = True
+                        print(f"  {GREEN}✓ DS18B20 found on {port}{RESET}")
+                        print(f"    Current ambient reading: {temp:.4f}°C")
+                        print(f"{'─'*60}\n")
                         return
-            except Exception:
-                continue
-        print("⚠  Arduino not found — ambient simulated, fan commands logged only.")
+                    else:
+                        print(f"  {YELLOW}✗ {port:<18}{RESET} — response out of DS18B20 range: {raw!r}")
+                        conn.close()
+                else:
+                    print(f"  {YELLOW}✗ {port:<18}{RESET} — no response from DS18B20")
+                    conn.close()
+
+            except serial.SerialException as e:
+                # port doesn't exist or is busy — don't print anything for
+                # fallback ports that simply aren't present on this machine
+                if preferred_port and port == preferred_port:
+                    print(f"  {RED}✗ {port:<18}{RESET} — could not open: {e}")
+            except ValueError:
+                print(f"  {YELLOW}✗ {port:<18}{RESET} — response not a valid float: {raw!r}")
+            except Exception as e:
+                print(f"  {YELLOW}✗ {port:<18}{RESET} — {e}")
+
+        # ── nothing worked ─────────────────────────────────────────────────────
+        print(f"\n  {YELLOW}⚠  No Arduino with DS18B20 found on any port.{RESET}")
+        print( "     Possible reasons:")
+        print( "       • USB cable not connected")
+        print( "       • Arduino sketch not uploaded (needs to respond to 'T\\n')")
+        print( "       • Permission denied — on Fedora, run:")
+        print( "           sudo usermod -aG dialout $USER   (then log out/in)")
+        print( "           sudo chmod a+rw /dev/ttyUSB0")
+        print( "       • Wrong baud rate — sketch must use Serial.begin(9600)")
+        print(f"\n  {YELLOW}Falling back to synthetic ambient (24°C ± 2°C sine wave).{RESET}")
+        print(f"{'─'*60}\n")
+
 
     # ── sensors ───────────────────────────────────────────────────────────────
     def _read_cpu_temp(self):
