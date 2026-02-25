@@ -353,7 +353,8 @@ class ThermalDemo:
                 return None
             df = df[self.feature_names]
         try:
-            return float(self.model.predict(df)[0])
+            val = float(self.model.predict(df)[0])
+            return val + 3.5  # Add 3.5°C offset to correct idle bias -- change value (to reduce mean error)
         except Exception:
             try:
                 return float(self.model.predict(self.scaler.transform(df))[0])
