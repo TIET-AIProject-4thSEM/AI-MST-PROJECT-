@@ -3,29 +3,39 @@ Proactive Thermal Management — Live Demo
 =========================================
 Run this while your workload generator stresses the CPU.
 
-HOW THE EARLY WARNING WORKS
-────────────────────────────
-The model predicts the *current* CPU temperature from workload signals
-(CPU utilisation, memory usage, ambient temp and their lags/smoothed values).
+HOW THE PROACTIVE COOLING WORKS
+─────────────────────────────────
+The model predicts the *current* CPU temperature from load signals
+(utilisation + its lag history + smoothed ambient).
 
-Because of thermal inertia, CPU load spikes 5–20 seconds BEFORE the die
-temperature catches up (Newton's Law of Cooling / Joule heating delay).
-So when the model returns a predicted_temp that is higher than the actual
-current reading, it means the load has already spiked but the hardware
-hasn't heated up yet — that gap is our proactive cooling window.
+It does not output a static value like "82°C". It outputs something
+semantically richer: "82°C and rising" or "82°C and falling".
 
-  predicted_temp > current_temp  →  heating trajectory detected → ramp fan NOW
-  predicted_temp ≈ current_temp  →  stable state
-  predicted_temp < current_temp  →  system is cooling → can reduce fan
+This comes from the lag features. If cpu_util_lag1, lag3, and lag6 are
+all high and climbing, the model outputs a HIGHER estimate than if the
+same current utilisation were preceded by a falling trajectory — even
+though the instantaneous reading is identical. That asymmetry encodes
+thermal inertia.
+
+Fan control uses BOTH outputs:
+
+  Estimate  →  sets base PWM (where is the temp right now?)
+  Δ = estimate − actual  →  trend boost/cut (which direction is it heading?)
+
+  Δ > 0  →  heating trajectory  →  boost fan above base
+  Δ ≈ 0  →  stable              →  hold base
+  Δ < 0  →  cooling trajectory  →  reduce fan below base
+
+This means fan response is driven by load trend, not by the temperature
+reading crossing a threshold — which is the difference between proactive
+and reactive control.
 
 Usage:
     python thermal_demo.py               # 5-minute run
-    python thermal_demo.py --minutes 10  # custom duration
-    python thermal_demo.py --port COM4   # with Arduino on a specific port
+    python thermal_demo.py --minutes 10
+    python thermal_demo.py --port COM4   # with Arduino
 
-Hardware (optional): REES52 DS18B20 sensor + REES52 L9110 H-bridge fan module.
-If no Arduino is found, ambient temperature is simulated and fan commands are
-logged only (no hardware output).
+Hardware (optional): REES52 DS18B20 + REES52 L9110 fan module.
 """
 
 import psutil
@@ -48,14 +58,14 @@ import matplotlib.gridspec as gridspec
 
 warnings.filterwarnings('ignore')
 
-# ── optional Arduino ──────────────────────────────────────────────────────────
 try:
     import serial
+    import serial.tools.list_ports
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
 
-# ── ANSI colours ──────────────────────────────────────────────────────────────
+# ── ANSI ─────────────────────────────────────────────────────────────────────
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 BLUE   = "\033[94m"
@@ -72,52 +82,51 @@ RESULT_CSV  = 'results/demo_log.csv'
 RESULT_PLOT = 'results/demo_summary.png'
 
 # ── thresholds ────────────────────────────────────────────────────────────────
-TEMP_WARNING  = 70.0   # °C — begin ramping fan
-TEMP_CRITICAL = 80.0   # °C — maximum fan
-SAFETY_BUFFER = 5.0    # °C — safety margin on top of model RMSE (~3.2°C)
+TEMP_WARNING  = 70.0   # °C
+TEMP_CRITICAL = 80.0   # °C
+SAFETY_BUFFER = 5.0    # °C  (safety band on plot; ~model RMSE × 1.5)
 
-# samples needed before the first prediction (lag-6 needs index -7, +1 guard)
-WARMUP_SAMPLES = 8
+# trend boost scaling:  each 1°C of positive delta adds this many PWM units
+TREND_GAIN      =  3.0   # boost when heating  (Δ > 0)
+TREND_REDUCTION =  2.0   # cut   when cooling  (Δ < 0)
+MAX_TREND_BOOST =  40    # PWM ceiling for trend contribution
+MAX_TREND_CUT   =  25    # PWM floor reduction for trend contribution
+
+# L9110 rate limiting
+MAX_FAN_STEP  = 20       # max PWM change per second
+MIN_FAN_PWM   = 30       # always spin slightly — prevents thermal paste stress
+
+WARMUP_SAMPLES = 8       # samples before first prediction (lag-6 needs 7+1)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 class ThermalDemo:
-    """
-    1 Hz proactive thermal prediction loop.
-
-    Features match exactly what the training notebook produced:
-        cpu_utilization_smooth, memory_usage_smooth, ambient_temp_smooth,
-        hour, day_of_week, is_business,
-        cpu_util_lag1, cpu_util_lag3, cpu_util_lag6
-    """
 
     def __init__(self, arduino_port=None):
         self.model         = None
         self.scaler        = None
         self.feature_names = None
-        self.model_rmse    = 3.24   # fallback if not in model_info.json
+        self.model_rmse    = 3.24
 
         self.arduino    = None
         self.arduino_ok = False
 
-        self.history = deque(maxlen=30)
-        self.log     = []
-
-        self.last_fan_pwm = 0
-        self.max_fan_step = 20
+        self.history      = deque(maxlen=30)
+        self.log          = []
+        self.last_fan_pwm = MIN_FAN_PWM
+        self.max_fan_step = MAX_FAN_STEP
 
         self._load_model()
-        if arduino_port:
-            self._init_arduino(arduino_port)
+        self._init_arduino(arduino_port)   # always auto-scan; port arg just goes first
 
-        psutil.cpu_percent(interval=None)   # prime non-blocking call
+        psutil.cpu_percent(interval=None)
         time.sleep(0.1)
 
     # ── model ─────────────────────────────────────────────────────────────────
     def _load_model(self):
         for path in (MODEL_PATH, SCALER_PATH):
             if not os.path.exists(path):
-                print(f"{RED}✗ Required file not found: {path}{RESET}")
+                print(f"{RED}✗ Not found: {path}{RESET}")
                 print("  Run Section 12 of the training notebook first.")
                 sys.exit(1)
 
@@ -130,18 +139,18 @@ class ThermalDemo:
             self.feature_names = info['features']
             self.model_rmse    = info.get('test_rmse', self.model_rmse)
             print(f"{GREEN}✓ Model loaded{RESET}  — {info['model_name']}")
-            print(f"  Test RMSE : {info['test_rmse']:.3f}°C   |   Test R² : {info['test_r2']:.4f}")
+            print(f"  Test RMSE : {info['test_rmse']:.3f}°C  |  R² : {info['test_r2']:.4f}")
             print(f"  Features  : {self.feature_names}")
         else:
-            print(f"{YELLOW}⚠  model_info.json not found — feature order inferred from model.{RESET}")
+            print(f"{YELLOW}⚠  model_info.json missing — feature order inferred.{RESET}")
 
-    # ── Arduino / DS18B20 ─────────────────────────────────────────────────────
+    # ── Arduino ───────────────────────────────────────────────────────────────
     def _init_arduino(self, port):
         if not SERIAL_AVAILABLE:
-            print("⚠  pyserial not installed — running without hardware.")
+            print("⚠  pyserial not installed — no hardware control.")
             return
-
-        for p in [port, '/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', 'COM3', 'COM4', 'COM5']:
+        for p in [port, '/dev/ttyUSB0', '/dev/ttyUSB1',
+                  '/dev/ttyACM0', 'COM3', 'COM4', 'COM5']:
             try:
                 self.arduino = serial.Serial(p, 9600, timeout=1)
                 time.sleep(2.5)
@@ -158,8 +167,7 @@ class ThermalDemo:
                         return
             except Exception:
                 continue
-
-        print("⚠  Arduino not found — ambient temperature will be simulated.")
+        print("⚠  Arduino not found — ambient simulated, fan commands logged only.")
 
     # ── sensors ───────────────────────────────────────────────────────────────
     def _read_cpu_temp(self):
@@ -203,38 +211,38 @@ class ThermalDemo:
     # ── feature engineering ───────────────────────────────────────────────────
     def _build_features(self, snap):
         """
-        Produces exactly the 9 features the notebook trained on:
+        Exactly mirrors the notebook's feature engineering:
 
-            cpu_utilization_smooth  5-sample rolling mean of cpu_utilization
-            memory_usage_smooth     5-sample rolling mean of memory_usage
-            ambient_temp_smooth     5-sample rolling mean of ambient_temp
-            hour                    raw hour of day (0-23)
-            day_of_week             Monday=0 … Sunday=6
-            is_business             1 if hour 8-18 on a weekday, else 0
-            cpu_util_lag1           cpu_utilization 1 sample ago
-            cpu_util_lag3           cpu_utilization 3 samples ago
-            cpu_util_lag6           cpu_utilization 6 samples ago
+            cpu_utilization_smooth  — 5-sample rolling mean
+            memory_usage_smooth     — 5-sample rolling mean
+            ambient_temp_smooth     — 5-sample rolling mean
+            hour                    — raw integer 0-23
+            day_of_week             — Mon=0 … Sun=6
+            is_business             — 1 if hour 8-18 on a weekday
+            cpu_util_lag1           — utilisation 1 s ago
+            cpu_util_lag3           — utilisation 3 s ago
+            cpu_util_lag6           — utilisation 6 s ago
+
+        The lag features are what give the model its trend awareness.
+        Rising lags → higher estimate than a flat or falling trajectory
+        at the same current utilisation value.
         """
         self.history.append(snap)
         n = len(self.history)
-
         if n < WARMUP_SAMPLES:
             return None
 
-        h = list(self.history)   # oldest → newest, h[-1] is current snap
+        h = list(self.history)   # h[-1] = newest
 
-        # rolling means — window=5, min_periods=1 (mirrors pandas training code)
         w              = min(5, n)
         cpu_smooth     = np.mean([s['cpu_util'] for s in h[-w:]])
         memory_smooth  = np.mean([s['memory']   for s in h[-w:]])
         ambient_smooth = np.mean([s['ambient']  for s in h[-w:]])
 
-        # lag features: h[-2]=1s ago, h[-4]=3s ago, h[-7]=6s ago
-        lag1 = h[-2]['cpu_util']
-        lag3 = h[-4]['cpu_util']
-        lag6 = h[-7]['cpu_util']
+        lag1 = h[-2]['cpu_util']   # 1 s ago
+        lag3 = h[-4]['cpu_util']   # 3 s ago
+        lag6 = h[-7]['cpu_util']   # 6 s ago
 
-        # time features
         now         = datetime.now()
         hour        = now.hour
         dow         = now.weekday()
@@ -255,15 +263,12 @@ class ThermalDemo:
     # ── prediction ────────────────────────────────────────────────────────────
     def _predict(self, features):
         df = pd.DataFrame([features])
-
         if self.feature_names:
             missing = set(self.feature_names) - set(df.columns)
             if missing:
                 print(f"{RED}✗ Feature mismatch — missing: {missing}{RESET}")
-                print("  Ensure model_info.json matches _build_features().")
                 return None
-            df = df[self.feature_names]   # enforce training column order
-
+            df = df[self.feature_names]
         try:
             return float(self.model.predict(df)[0])
         except Exception:
@@ -274,24 +279,66 @@ class ThermalDemo:
                 return None
 
     # ── fan control ───────────────────────────────────────────────────────────
-    def _fan_command(self, predicted_temp, current_temp):
-        t = predicted_temp if predicted_temp is not None else current_temp
+    def _fan_command(self, estimate, actual):
+        """
+        Two-signal fan control:
 
-        if t >= TEMP_CRITICAL:
-            target, label, colour = 255, "CRITICAL", RED
-        elif t >= TEMP_WARNING:
-            ratio  = (t - TEMP_WARNING) / (TEMP_CRITICAL - TEMP_WARNING)
-            target = int(128 + 127 * ratio)
-            label, colour = "WARNING ", YELLOW
-        elif t >= 60:
-            target, label, colour = 100, "ELEVATED", BLUE
+        Signal 1 — ESTIMATE sets the base PWM zone:
+            < 60°C          →  base 50  (low, quiet)
+            60 – 70°C       →  base 100 (elevated)
+            70 – 80°C       →  base 128–254 (warning ramp)
+            ≥ 80°C          →  base 255 (maximum)
+
+        Signal 2 — DELTA (estimate − actual) applies a trend correction:
+            Δ > 0  (rising)   →  boost  by Δ × TREND_GAIN   (up to +40 PWM)
+            Δ < 0  (cooling)  →  reduce by |Δ| × TREND_REDUCTION (up to −25 PWM)
+            Δ ≈ 0  (stable)   →  no correction
+
+        The combined PWM is then rate-limited (±20/s) to protect the L9110
+        from sudden load spikes, and floored at MIN_FAN_PWM.
+
+        Status label reflects both signals so the output is self-explanatory.
+        """
+        delta = estimate - actual
+
+        # ── signal 1: base PWM from estimate ──────────────────────────────────
+        if estimate >= TEMP_CRITICAL:
+            base = 255
+            zone = "CRITICAL"
+            colour = RED
+        elif estimate >= TEMP_WARNING:
+            ratio = (estimate - TEMP_WARNING) / (TEMP_CRITICAL - TEMP_WARNING)
+            base  = int(128 + 127 * ratio)
+            zone  = "WARNING"
+            colour = YELLOW
+        elif estimate >= 60:
+            base   = 100
+            zone   = "ELEVATED"
+            colour = BLUE
         else:
-            target, label, colour = 50,  "NORMAL  ", GREEN
+            base   = 50
+            zone   = "NORMAL"
+            colour = GREEN
 
-        pwm = int(np.clip(target,
-                          self.last_fan_pwm - self.max_fan_step,
-                          self.last_fan_pwm + self.max_fan_step))
+        # ── signal 2: trend correction from delta ─────────────────────────────
+        if delta > 0.5:
+            trend_pwm = int(min(delta * TREND_GAIN, MAX_TREND_BOOST))
+            trend_sym = "↑"
+        elif delta < -0.5:
+            trend_pwm = -int(min(abs(delta) * TREND_REDUCTION, MAX_TREND_CUT))
+            trend_sym = "↓"
+        else:
+            trend_pwm = 0
+            trend_sym = "→"
+
+        # ── combine, rate-limit, floor ────────────────────────────────────────
+        target = int(np.clip(base + trend_pwm, MIN_FAN_PWM, 255))
+        pwm    = int(np.clip(target,
+                             self.last_fan_pwm - self.max_fan_step,
+                             self.last_fan_pwm + self.max_fan_step))
         self.last_fan_pwm = pwm
+
+        label = f"{zone} {trend_sym}"
 
         if self.arduino_ok:
             try:
@@ -300,7 +347,7 @@ class ThermalDemo:
             except Exception:
                 self.arduino_ok = False
 
-        return pwm, label, colour
+        return pwm, base, trend_pwm, label, colour
 
     # ── summary plot ──────────────────────────────────────────────────────────
     def _save_plot(self):
@@ -308,72 +355,109 @@ class ThermalDemo:
         df = pd.DataFrame(self.log)
         df['t'] = range(len(df))
 
-        fig = plt.figure(figsize=(16, 10))
+        fig = plt.figure(figsize=(18, 11))
         fig.patch.set_facecolor('#0d1117')
-        gs  = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.3)
+        gs  = gridspec.GridSpec(3, 2, figure=fig,
+                                hspace=0.48, wspace=0.32,
+                                height_ratios=[2, 1, 1])
 
         def _style(ax, title):
             ax.set_facecolor('#161b22')
-            ax.set_title(title, color='white', fontsize=11, pad=8)
-            ax.tick_params(colors='#8b949e')
+            ax.set_title(title, color='white', fontsize=10, pad=7)
+            ax.tick_params(colors='#8b949e', labelsize=8)
             ax.spines[:].set_color('#30363d')
             ax.xaxis.label.set_color('#8b949e')
             ax.yaxis.label.set_color('#8b949e')
-            ax.grid(True, color='#21262d', linewidth=0.8)
+            ax.grid(True, color='#21262d', linewidth=0.7)
 
-        # temperature trace
+        # ── panel 1: temperature — full width ─────────────────────────────────
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(df['t'], df['actual_temp'],    color='#58a6ff', lw=1.5,
                  label='Actual CPU temp', alpha=0.95)
-        ax1.plot(df['t'], df['predicted_temp'], color='#f78166', lw=1.2,
-                 ls='--', label='Model estimate (load-aware)', alpha=0.9)
+        ax1.plot(df['t'], df['estimate'],       color='#f78166', lw=1.2,
+                 ls='--', label='Model estimate (trend-aware)', alpha=0.9)
         ax1.fill_between(df['t'],
-                         df['predicted_temp'] - SAFETY_BUFFER,
-                         df['predicted_temp'] + SAFETY_BUFFER,
-                         color='#f78166', alpha=0.08,
+                         df['estimate'] - SAFETY_BUFFER,
+                         df['estimate'] + SAFETY_BUFFER,
+                         color='#f78166', alpha=0.07,
                          label=f'±{SAFETY_BUFFER}°C safety band')
         ax1.axhline(TEMP_WARNING,  color='#e3b341', ls=':', lw=1.2, alpha=0.8,
                     label=f'Warning {TEMP_WARNING}°C')
         ax1.axhline(TEMP_CRITICAL, color='#f85149', ls=':', lw=1.2, alpha=0.8,
                     label=f'Critical {TEMP_CRITICAL}°C')
-        ax1.set_ylabel('Temperature (°C)')
-        ax1.set_xlabel('Sample (seconds)')
-        ax1.legend(fontsize=8.5, loc='upper left',
+        ax1.set_ylabel('Temperature (°C)', fontsize=9)
+        ax1.set_xlabel('Sample (seconds)', fontsize=9)
+        ax1.legend(fontsize=8, loc='upper left',
                    facecolor='#1c2128', edgecolor='#30363d', labelcolor='white')
-        _style(ax1, 'CPU Temperature — Actual vs Model Estimate')
+        _style(ax1, 'CPU Temperature — Actual vs Trend-Aware Model Estimate')
 
-        # CPU load
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.plot(df['t'], df['cpu_load'], color='#3fb950', lw=1.2, alpha=0.9)
-        ax2.fill_between(df['t'], 0, df['cpu_load'], color='#3fb950', alpha=0.18)
-        ax2.set_ylim(0, 105)
-        ax2.set_ylabel('CPU Utilisation (%)')
-        ax2.set_xlabel('Sample (seconds)')
-        _style(ax2, 'CPU Utilisation')
+        # ── panel 2: delta (trend signal) ─────────────────────────────────────
+        ax_d = fig.add_subplot(gs[1, 0])
+        pos = df['delta'].clip(lower=0)
+        neg = df['delta'].clip(upper=0)
+        ax_d.fill_between(df['t'], 0, pos, color='#f78166', alpha=0.7,
+                          label='Heating (Δ > 0)')
+        ax_d.fill_between(df['t'], 0, neg, color='#58a6ff', alpha=0.7,
+                          label='Cooling (Δ < 0)')
+        ax_d.plot(df['t'], df['delta'], color='#e6edf3', lw=0.8, alpha=0.6)
+        ax_d.axhline(0, color='#8b949e', lw=0.8, ls='--')
+        ax_d.set_ylabel('Δ Estimate − Actual (°C)', fontsize=8)
+        ax_d.set_xlabel('Sample (seconds)', fontsize=8)
+        ax_d.legend(fontsize=7.5, facecolor='#1c2128',
+                    edgecolor='#30363d', labelcolor='white')
+        _style(ax_d, 'Trend Signal  (proactive trigger)')
 
-        # fan speed
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.plot(df['t'], df['fan_pwm'], color='#d2a8ff', lw=1.2, alpha=0.9)
-        ax3.fill_between(df['t'], 0, df['fan_pwm'], color='#d2a8ff', alpha=0.18)
-        ax3.set_ylim(0, 275)
-        ax3.set_ylabel('Fan PWM (0–255)')
-        ax3.set_xlabel('Sample (seconds)')
-        _style(ax3, 'L9110 Fan Speed (Proactive Response)')
+        # ── panel 3: CPU load ─────────────────────────────────────────────────
+        ax_l = fig.add_subplot(gs[1, 1])
+        ax_l.plot(df['t'], df['cpu_load'], color='#3fb950', lw=1.2, alpha=0.9)
+        ax_l.fill_between(df['t'], 0, df['cpu_load'], color='#3fb950', alpha=0.18)
+        ax_l.set_ylim(0, 105)
+        ax_l.set_ylabel('CPU Utilisation (%)', fontsize=8)
+        ax_l.set_xlabel('Sample (seconds)', fontsize=8)
+        _style(ax_l, 'CPU Utilisation')
 
-        delta = df['predicted_temp'] - df['actual_temp']
+        # ── panel 4: fan PWM breakdown ────────────────────────────────────────
+        ax_f = fig.add_subplot(gs[2, :])
+        ax_f.plot(df['t'], df['fan_pwm'],   color='#d2a8ff', lw=1.5,
+                  label='Final PWM (rate-limited)', alpha=0.95)
+        ax_f.plot(df['t'], df['base_pwm'],  color='#79c0ff', lw=1.0,
+                  ls='--', label='Base PWM (from estimate)', alpha=0.7)
+        ax_f.fill_between(df['t'],
+                          df['base_pwm'],
+                          df['fan_pwm'],
+                          where=(df['fan_pwm'] > df['base_pwm']),
+                          color='#f78166', alpha=0.25,
+                          label='Trend boost (+)')
+        ax_f.fill_between(df['t'],
+                          df['fan_pwm'],
+                          df['base_pwm'],
+                          where=(df['fan_pwm'] < df['base_pwm']),
+                          color='#58a6ff', alpha=0.25,
+                          label='Trend reduction (−)')
+        ax_f.set_ylim(0, 275)
+        ax_f.set_ylabel('Fan PWM (0–255)', fontsize=9)
+        ax_f.set_xlabel('Sample (seconds)', fontsize=9)
+        ax_f.legend(fontsize=8, loc='upper left',
+                    facecolor='#1c2128', edgecolor='#30363d', labelcolor='white')
+        _style(ax_f, 'L9110 Fan Control — Base PWM + Trend Correction')
+
+        # stats box
+        delta = df['delta']
         stats = (
             f"Samples      : {len(df)}\n"
             f"Actual range : {df['actual_temp'].min():.1f}–{df['actual_temp'].max():.1f}°C\n"
-            f"Mean Δ(est−act) : {delta.mean():+.2f}°C\n"
-            f"Max  Δ(est−act) : {delta.abs().max():.2f}°C\n"
-            f"Ambient avg  : {df['ambient_temp'].mean():.1f}°C\n"
+            f"Mean Δ       : {delta.mean():+.2f}°C\n"
+            f"Max  |Δ|     : {delta.abs().max():.2f}°C\n"
+            f"Heating ticks: {(delta > 0.5).sum()}\n"
+            f"Cooling ticks: {(delta < -0.5).sum()}\n"
             f"Fan range    : {df['fan_pwm'].min()}–{df['fan_pwm'].max()} PWM"
         )
-        fig.text(0.77, 0.09, stats, fontsize=8.5, color='#c9d1d9',
+        fig.text(0.80, 0.05, stats, fontsize=8, color='#c9d1d9',
                  bbox=dict(boxstyle='round,pad=0.6',
                            facecolor='#1c2128', edgecolor='#30363d'))
+
         fig.suptitle('Proactive Thermal Management — Demo Summary',
-                     color='white', fontsize=14, fontweight='bold', y=0.98)
+                     color='white', fontsize=13, fontweight='bold', y=0.99)
 
         plt.savefig(RESULT_PLOT, dpi=140, bbox_inches='tight',
                     facecolor=fig.get_facecolor())
@@ -383,16 +467,15 @@ class ThermalDemo:
     # ── main loop ─────────────────────────────────────────────────────────────
     def run(self, duration_minutes=5):
         hw = "DS18B20 + L9110" if self.arduino_ok else "Software simulation"
-        print(f"\n{BOLD}{'═'*72}{RESET}")
+        print(f"\n{BOLD}{'═'*76}{RESET}")
         print(f"{BOLD}  PROACTIVE THERMAL MANAGEMENT — LIVE DEMO{RESET}")
         print(f"  Hardware   : {hw}")
-        print(f"  Duration   : {duration_minutes} min  |  Sample rate: 1 Hz")
+        print(f"  Duration   : {duration_minutes} min  |  1 Hz sample rate")
         print(f"  Thresholds : WARNING {TEMP_WARNING}°C  |  CRITICAL {TEMP_CRITICAL}°C")
-        print(f"  Safety band: ±{SAFETY_BUFFER}°C  |  Model RMSE: ~{self.model_rmse:.2f}°C")
-        print(f"\n  HOW IT WORKS: CPU load spikes before temperature does (thermal inertia).")
-        print(f"  The model estimates temp from load — a +ve gap means heat is building.")
-        print(f"  Fan adjusts on the ESTIMATE, not the actual reading.")
-        print(f"{BOLD}{'═'*72}{RESET}\n")
+        print(f"  Model RMSE : ~{self.model_rmse:.2f}°C  |  Safety band: ±{SAFETY_BUFFER}°C")
+        print(f"\n  FAN LOGIC  : Base PWM set by estimate.  Trend Δ adds a boost (↑)")
+        print(f"               or reduction (↓) on top.  Rate-limited ±{MAX_FAN_STEP} PWM/s.")
+        print(f"{BOLD}{'═'*76}{RESET}\n")
         print(f"  Warming up — collecting {WARMUP_SAMPLES} initial samples…")
 
         os.makedirs(os.path.dirname(RESULT_CSV) or '.', exist_ok=True)
@@ -417,43 +500,65 @@ class ThermalDemo:
                     continue
 
                 if not header_printed:
-                    print(f"\n\n{'─'*76}")
-                    print(f"  {'Time':8s}  {'Actual':>8s}  {'Estimate':>10s}  "
-                          f"{'Δ(est-act)':>11s}  {'Status':9s}  {'Fan':>7s}  {'Load':>5s}")
-                    print(f"{'─'*76}")
+                    print(f"\n\n{'─'*84}")
+                    print(
+                        f"  {'Time':8s}  "
+                        f"{'Actual':>7s}  "
+                        f"{'Estimate':>9s}  "
+                        f"{'Δ(est-act)':>10s}  "
+                        f"{'Trend':>5s}  "
+                        f"{'Status':12s}  "
+                        f"{'Base':>4s}  "
+                        f"{'PWM':>7s}  "
+                        f"{'Load':>5s}"
+                    )
+                    print(f"{'─'*84}")
                     header_printed = True
 
-                predicted = self._predict(features)
-                if predicted is None:
+                estimate = self._predict(features)
+                if estimate is None:
                     next_tick += 1.0
                     _sleep_until(next_tick)
                     continue
 
                 actual = snap['cpu_temp']
-                delta  = predicted - actual
-                pwm, label, colour = self._fan_command(predicted, actual)
+                delta  = estimate - actual
+                pwm, base_pwm, trend_pwm, label, colour = self._fan_command(estimate, actual)
+
+                # trend arrow and sign for display
+                if delta > 0.5:
+                    trend_disp = f"{RED}↑{RESET} {delta:+.1f}°C"
+                elif delta < -0.5:
+                    trend_disp = f"{BLUE}↓{RESET} {delta:+.1f}°C"
+                else:
+                    trend_disp = f"{GREEN}→{RESET} {delta:+.1f}°C"
+
                 ts = datetime.now().strftime('%H:%M:%S')
 
                 print(
                     f"  {ts}  "
-                    f"{actual:6.2f}°C  "
-                    f"{predicted:8.2f}°C  "
-                    f"{delta:+9.2f}°C  "
-                    f"{colour}{label}{RESET}  "
+                    f"{actual:5.1f}°C  "
+                    f"{estimate:7.1f}°C  "
+                    f"{delta:+8.2f}°C  "
+                    f"  {trend_disp}  "
+                    f"{colour}{label:<12}{RESET}  "
+                    f"{base_pwm:4d}  "
                     f"{pwm:4d}/255  "
                     f"{snap['cpu_util']:4.0f}%",
                     flush=True
                 )
 
                 self.log.append({
-                    'timestamp':      ts,
-                    'actual_temp':    actual,
-                    'predicted_temp': predicted,
-                    'delta':          delta,
-                    'cpu_load':       snap['cpu_util'],
-                    'ambient_temp':   snap['ambient'],
-                    'fan_pwm':        pwm,
-                    'status':         label.strip(),
+                    'timestamp':  ts,
+                    'actual_temp': actual,
+                    'estimate':    estimate,
+                    'delta':       delta,
+                    'base_pwm':    base_pwm,
+                    'trend_pwm':   trend_pwm,
+                    'fan_pwm':     pwm,
+                    'status':      label,
+                    'cpu_load':    snap['cpu_util'],
+                    'ambient_temp': snap['ambient'],
                 })
 
                 next_tick += 1.0
@@ -478,32 +583,38 @@ class ThermalDemo:
                 pass
 
         if not self.log:
-            print("No predictions were made.")
+            print("No predictions recorded.")
             return
 
-        df         = pd.DataFrame(self.log)
+        df = pd.DataFrame(self.log)
         df.to_csv(RESULT_CSV, index=False)
 
-        delta      = df['predicted_temp'] - df['actual_temp']
-        n_warning  = (df['status'] == 'WARNING').sum()
-        n_critical = (df['status'] == 'CRITICAL').sum()
+        delta     = df['delta']
+        n_heating = (delta > 0.5).sum()
+        n_cooling = (delta < -0.5).sum()
+        n_stable  = len(df) - n_heating - n_cooling
 
-        print(f"\n{BOLD}{'═'*72}{RESET}")
+        print(f"\n{BOLD}{'═'*76}{RESET}")
         print(f"{BOLD}  DEMO SUMMARY{RESET}")
-        print(f"{'─'*72}")
-        print(f"  {'Total predictions':32s}: {len(df)}")
-        print(f"  {'Actual temp range':32s}: {df['actual_temp'].min():.1f}°C – {df['actual_temp'].max():.1f}°C")
-        print(f"  {'Mean Δ (estimate − actual)':32s}: {delta.mean():+.2f}°C")
-        print(f"  {'Max  Δ (estimate − actual)':32s}: {delta.abs().max():.2f}°C")
-        print(f"  {'Ambient avg (DS18B20/sim)':32s}: {df['ambient_temp'].mean():.2f}°C")
-        print(f"  {'Fan PWM range':32s}: {df['fan_pwm'].min()} – {df['fan_pwm'].max()} / 255")
-        print(f"  {'WARNING-level ticks':32s}: {n_warning}")
-        print(f"  {'CRITICAL-level ticks':32s}: {n_critical}")
-        print(f"{'─'*72}")
+        print(f"{'─'*76}")
+        print(f"  {'Total predictions':34s}: {len(df)}")
+        print(f"  {'Actual temp range':34s}: "
+              f"{df['actual_temp'].min():.1f}°C – {df['actual_temp'].max():.1f}°C")
+        print(f"  {'Estimate range':34s}: "
+              f"{df['estimate'].min():.1f}°C – {df['estimate'].max():.1f}°C")
+        print(f"  {'Mean Δ (estimate − actual)':34s}: {delta.mean():+.2f}°C")
+        print(f"  {'Max  |Δ|':34s}: {delta.abs().max():.2f}°C")
+        print(f"  {'Heating ticks  (Δ > +0.5°C)':34s}: {n_heating}  {RED}↑{RESET}")
+        print(f"  {'Stable  ticks  (|Δ| ≤ 0.5°C)':34s}: {n_stable}  {GREEN}→{RESET}")
+        print(f"  {'Cooling ticks  (Δ < −0.5°C)':34s}: {n_cooling}  {BLUE}↓{RESET}")
+        print(f"  {'Fan PWM range':34s}: "
+              f"{df['fan_pwm'].min()} – {df['fan_pwm'].max()} / 255")
+        print(f"  {'Ambient avg (DS18B20/sim)':34s}: {df['ambient_temp'].mean():.2f}°C")
+        print(f"{'─'*76}")
         print(f"  {GREEN}✓ Log saved → {RESULT_CSV}{RESET}")
 
         self._save_plot()
-        print(f"{BOLD}{'═'*72}{RESET}\n")
+        print(f"{BOLD}{'═'*76}{RESET}\n")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -516,22 +627,27 @@ def _sleep_until(t):
 # ── entry point ───────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     print(f"""
-\033[1m\033[96m╔══════════════════════════════════════════════════════════════╗
-║       PROACTIVE THERMAL MANAGEMENT  ·  LIVE DEMO            ║
-║  Load-aware ML estimate → fan acts before temperature spikes ║
-╚══════════════════════════════════════════════════════════════╝\033[0m
+\033[1m\033[96m╔══════════════════════════════════════════════════════════════════╗
+║       PROACTIVE THERMAL MANAGEMENT  ·  LIVE DEMO              ║
+║                                                                ║
+║  Estimate  →  base fan PWM  (where is temp now?)              ║
+║  Δ = estimate − actual  →  trend boost / cut  (↑ ↓ →)        ║
+║                                                                ║
+║  Rising lags in model → higher estimate → fan boosts early    ║
+╚══════════════════════════════════════════════════════════════════╝\033[0m
 """)
+
     parser = argparse.ArgumentParser(description='Thermal prediction live demo')
     parser.add_argument('--minutes', type=int, default=5,
-                        help='Monitoring duration in minutes (default: 5)')
+                        help='Duration in minutes (default: 5)')
     parser.add_argument('--port', type=str, default=None,
-                        help='Arduino serial port, e.g. COM4 or /dev/ttyUSB0')
+                        help='Arduino port, e.g. COM4 or /dev/ttyUSB0')
     args = parser.parse_args()
 
     demo = ThermalDemo(arduino_port=args.port)
     print(f"\n\033[1m▶ Starting {args.minutes}-minute demo…\033[0m")
-    print("  Launch your workload generator now, then watch the output.")
-    print("  Ctrl+C stops early and still saves the summary.\n")
+    print("  Launch your workload generator now.")
+    print("  Watch the Trend column — fan responds to ↑ before temp peaks.\n")
     time.sleep(2)
 
     demo.run(duration_minutes=args.minutes)
